@@ -1,0 +1,16 @@
+name: Coin
+version: 1.0
+main: com.foxsrv.coin.Main
+api-version: "1.21"
+depend:
+  - Vault
+softdepend:
+  - PlaceholderAPI
+commands:
+  coin:
+    description: Main command for Coin API plugin
+    usage: /coin <subcommand> [args]
+permissions:
+  coin.admin:
+    description: Allows /coin reload
+    default: op

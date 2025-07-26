@@ -1,0 +1,6 @@
+card: your_card
+id: your_coin_id
+owner: your_nick
+cambio: 0.0001
+reverse: 0.000075
+api: http://coin.foxsrv.net:26450/
