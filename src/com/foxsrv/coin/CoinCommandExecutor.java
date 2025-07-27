@@ -40,6 +40,11 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.io.File;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Map;
+import java.util.AbstractMap;
 
 public class CoinCommandExecutor implements CommandExecutor, TabCompleter {
     private final Main plugin;
@@ -299,37 +304,66 @@ private boolean doLogin(CommandSender s, String[] a) {
         return true;
     }
 
-private boolean doBaltop(CommandSender s) {
-    if (!checkLogin(s)) return true;
+private boolean doBaltop(CommandSender sender) {
+    // 1) Valida login e tipo de sender
+    if (!checkLogin(sender)) return true;
+    if (!(sender instanceof Player)) {
+        send(sender, "Only players can use this command.");
+        return true;
+    }
+
+    // 2) Executa de forma assíncrona
     new BukkitRunnable() {
         @Override
         public void run() {
             try {
-                FileConfiguration uc = users.getUserConfig(((Player) s).getName());
-                String resp = api.get("/api/rank", uc.getString("session"));
-                // Pattern para cada objeto {"userId":"...", "coins":...}
-                Pattern pat = Pattern.compile("\\{\"userId\":\"(\\d+)\",\"coins\":([0-9.]+)\\}");
-                Matcher m = pat.matcher(resp);
+                // 3) Pasta "users" dentro da pasta do plugin
+                File usersDir = new File(plugin.getDataFolder(), "users");
+                if (!usersDir.exists() || !usersDir.isDirectory()) {
+                    sendSync(sender, "§cNo user data directory found.");
+                    return;
+                }
 
-                StringBuilder sb = new StringBuilder("§bTop 25 Richest (by ID):\n");
-                int i = 1;
-                while (m.find() && i <= 25) {
-                    sb.append(i).append(". ").append(m.group(1)).append("\n");
-                    i++;
+                // 4) Carrega cada arquivo .yml e coleta username + balance
+                List<Map.Entry<String, Double>> list = new ArrayList<>();
+                for (File f : usersDir.listFiles((dir, name) -> name.endsWith(".yml"))) {
+                    FileConfiguration cfg = YamlConfiguration.loadConfiguration(f);
+                    String username = cfg.getString("username", f.getName().replace(".yml", ""));
+                    double balance  = cfg.getDouble("balance", 0.0);
+                    list.add(new AbstractMap.SimpleEntry<>(username, balance));
                 }
-                // Caso não haja dados:
-                if (i == 1) {
-                    sb.append("No data available.");
+
+                // 5) Ordena por balance desc e pega top 10
+                list.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
+                int max = Math.min(10, list.size());
+
+                // 6) Monta a mensagem
+                StringBuilder sb = new StringBuilder("§bTop ").append(max).append(" Richest Players:\n\n");
+                if (max == 0) {
+                    sb.append("§eNo player data available.");
+                } else {
+                    for (int i = 0; i < max; i++) {
+                        Map.Entry<String, Double> entry = list.get(i);
+                        sb.append("§e").append(i + 1).append(". §f")
+                          .append(entry.getKey())
+                          .append(" — ").append(fmt(entry.getValue()))
+                          .append("\n");
+                    }
                 }
-                sendSync(s, sb.toString());
+
+                // 7) Envia no chat principal
+                sendSync(sender, sb.toString());
+
             } catch (Exception e) {
-                plugin.getLogger().warning("Baltop: " + e);
-                sendSync(s, "Error fetching toplist.");
+                plugin.getLogger().warning("doBaltop error: " + e.getMessage());
+                sendSync(sender, "§cError fetching baltop.");
             }
         }
     }.runTaskAsynchronously(plugin);
+
     return true;
 }
+
 
     private boolean doBuy(CommandSender sender, String[] args) {
         // 0) Cooldown de 1,1 segundo
