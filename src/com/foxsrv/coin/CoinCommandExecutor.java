@@ -4,6 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.stream.JsonReader;
 
 import me.clip.placeholderapi.PlaceholderAPI;
 
@@ -24,6 +25,7 @@ import org.bukkit.scheduler.BukkitRunnable;
 import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.function.Function;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -33,6 +35,11 @@ import java.util.ArrayList;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.io.StringReader;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 
 public class CoinCommandExecutor implements CommandExecutor, TabCompleter {
     private final Main plugin;
@@ -795,54 +802,83 @@ private boolean doBill(CommandSender sender, String[] args) {
     }
 
 private boolean doListBills(CommandSender sender) {
-    // 1) valida login e tipo
+    // 1) Valida login e tipo de sender
     if (!checkLogin(sender)) return true;
     if (!(sender instanceof Player)) {
         send(sender, "Only players can use this command.");
         return true;
     }
+
     Player player = (Player) sender;
     FileConfiguration uc = users.getUserConfig(player.getName());
     final String sessionToken = uc.getString("session");
 
-    // 2) chama API de forma assíncrona
+    // 2) Chama API de forma assíncrona
     new BukkitRunnable() {
         @Override
         public void run() {
             try {
+                // 3) Lista faturas pendentes
                 String resp = api.post("/api/bill/list", "{\"page\":1}", sessionToken);
-
-                // 3) parseia JSON
-                JsonObject root     = JsonParser.parseString(resp).getAsJsonObject();
+                JsonObject root     = parseLenient(resp);
                 JsonArray toPay     = root.has("toPay")     ? root.getAsJsonArray("toPay")     : new JsonArray();
                 JsonArray toReceive = root.has("toReceive") ? root.getAsJsonArray("toReceive") : new JsonArray();
 
-                // 4) coleta todos os IDs de faturas
-                List<String> ids = new ArrayList<>();
-                for (JsonElement el : toPay)     ids.add(el.getAsJsonObject().get("billId").getAsString());
-                for (JsonElement el : toReceive) ids.add(el.getAsJsonObject().get("billId").getAsString());
+                // 4) Junta todos os registros em um só array
+                JsonArray all = new JsonArray();
+                toPay.forEach(all::add);
+                toReceive.forEach(all::add);
 
-                // 5) formata e envia
-                if (ids.isEmpty()) {
-                    sendSync(sender, "ℹ️ You do not have any pending bills.");
+                // 5) Formatter para data
+                DateTimeFormatter df = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+
+                // 6) Monta a mensagem no estilo /coin history
+                if (all.isEmpty()) {
+                    sendSync(sender, "§eYou have no pending bills.");
                 } else {
-                    StringBuilder sb = new StringBuilder();
-                    sb.append("📋 **Your bills (").append(ids.size()).append("):**\n");
-                    for (int i = 0; i < ids.size(); i++) {
-                        sb.append("**").append(i + 1).append(".** `").append(ids.get(i)).append("`\n");
+                    StringBuilder sb = new StringBuilder("§6Your Pending Bills:\n\n");
+                    int count = Math.min(20, all.size());
+                    for (int i = 0; i < count; i++) {
+                        JsonObject bill = all.get(i).getAsJsonObject();
+
+                        // Extrai o ID da fatura
+                        String billId = bill.has("billId")   ? bill.get("billId").getAsString()
+                                      : bill.has("id")       ? bill.get("id").getAsString()
+                                      : "–";
+
+                        // Extrai valor
+                        double amount = bill.has("amount") ? bill.get("amount").getAsDouble() : 0;
+
+                        // Extrai timestamp e formata para dd/MM/yyyy
+                        String rawDate = bill.has("date") ? bill.get("date").getAsString() : null;
+                        String date;
+                        try {
+                            long epochMs = Long.parseLong(rawDate);
+                            LocalDateTime dt = LocalDateTime.ofInstant(Instant.ofEpochMilli(epochMs), ZoneId.systemDefault());
+                            date = dt.format(df);
+                        } catch (Exception ex) {
+                            date = rawDate != null ? rawDate : "–";
+                        }
+
+                        sb.append("§eBill #").append(i + 1).append(":\n")
+                          .append(" §fID: ").append(billId).append("\n")
+                          .append(" §fAmount: ").append(fmt(amount)).append("\n")
+                          .append(" §fDate: ").append(date).append("\n")
+                          .append("§7-------------------------\n");
                     }
                     sendSync(sender, sb.toString());
                 }
 
             } catch (Exception e) {
                 plugin.getLogger().warning("doListBills error: " + e.getMessage());
-                sendSync(sender, "Error listing bills.");
+                sendSync(sender, "§cError listing bills. Please try again later.");
             }
         }
     }.runTaskAsynchronously(plugin);
 
     return true;
 }
+
 
 
 /**
@@ -872,7 +908,7 @@ private boolean doHistory(CommandSender sender) {
     FileConfiguration uc = users.getUserConfig(player.getName());
     final String sessionToken = uc.getString("session");
 
-    // 2) Chama a API de forma assíncrona
+    // 2) Executa a chamada à API de forma assíncrona
     new BukkitRunnable() {
         @Override
         public void run() {
@@ -886,37 +922,62 @@ private boolean doHistory(CommandSender sender) {
                     ? root.getAsJsonArray("transactions")
                     : new JsonArray();
 
-                // 5) Monta a mensagem com até 20 itens, formatados
-                StringBuilder sb = new StringBuilder("Transaction History:\n\n");
+                // 5) Função auxiliar para extrair IDs
+                Function<JsonElement, String> extractId = e -> {
+                    if (e.isJsonPrimitive()) {
+                        return e.getAsString();
+                    } else if (e.isJsonObject()) {
+                        JsonObject o = e.getAsJsonObject();
+                        if (o.has("userId")) return o.get("userId").getAsString();
+                        if (o.has("id"))     return o.get("id").getAsString();
+                    }
+                    return "–";
+                };
+
+                // 6) Monta a mensagem
+                StringBuilder sb = new StringBuilder("§6Transaction History:\n\n");
                 if (txs.isEmpty()) {
-                    sb.append("No transactions found.\n");
+                    sb.append("§cNo transactions found.\n");
                 } else {
                     int count = Math.min(20, txs.size());
                     for (int i = 0; i < count; i++) {
                         JsonObject tx = txs.get(i).getAsJsonObject();
 
-                        // Campos do objeto de transação
-                        String txId   = tx.has("txId")   ? tx.get("txId").getAsString()   : "";
-                        String from   = tx.has("from")   ? tx.get("from").getAsString()   : "";
-                        String to     = tx.has("to")     ? tx.get("to").getAsString()     : "";
-                        double amt    = tx.has("amount") ? tx.get("amount").getAsDouble() : 0;
-                        String date   = tx.has("date")   ? tx.get("date").getAsString()   : "";
+                        // txId ou id
+                        String txId = tx.has("txId")   ? tx.get("txId").getAsString()
+                                     : tx.has("id")    ? tx.get("id").getAsString()
+                                     : "–";
 
-                        sb.append("ID: ").append(txId).append("\n")
-                          .append("From: ").append(from).append("\n")
-                          .append("To: ").append(to).append("\n")
-                          .append("Amount: ").append(fmt(amt)).append("\n")
-                          .append("Date: ").append(date).append("\n")
-                          .append("-------------------------\n");
+                        // from (camelCase, snake_case ou primitivo/objeto)
+                        String fromId = tx.has("fromId")   ? extractId.apply(tx.get("fromId"))
+                                      : tx.has("from_id")  ? extractId.apply(tx.get("from_id"))
+                                      : tx.has("from")     ? extractId.apply(tx.get("from"))
+                                      : "–";
+
+                        // to
+                        String toId = tx.has("toId")     ? extractId.apply(tx.get("toId"))
+                                    : tx.has("to_id")    ? extractId.apply(tx.get("to_id"))
+                                    : tx.has("to")       ? extractId.apply(tx.get("to"))
+                                    : "–";
+
+                        double amt  = tx.has("amount") ? tx.get("amount").getAsDouble() : 0;
+                        String date = tx.has("date")   ? tx.get("date").getAsString()   : "–";
+
+                        sb.append("§eID: ").append(txId).append("\n")
+                          .append("§eFrom: ").append(fromId).append("\n")
+                          .append("§eTo: ").append(toId).append("\n")
+                          .append("§eAmount: ").append(fmt(amt)).append("\n")
+                          .append("§eDate: ").append(date).append("\n")
+                          .append("§7-------------------------\n");
                     }
                 }
 
-                // 6) Envia no thread principal
+                // 7) Envia no thread principal
                 sendSync(sender, sb.toString());
 
             } catch (Exception e) {
                 plugin.getLogger().warning("doHistory error: " + e.getMessage());
-                sendSync(sender, "Error fetching transaction history.");
+                sendSync(sender, "§cError fetching transaction history.");
             }
         }
     }.runTaskAsynchronously(plugin);
@@ -924,8 +985,9 @@ private boolean doHistory(CommandSender sender) {
     return true;
 }
 
+
 private boolean doClaim(CommandSender sender) {
-    // 1) Valida login e tipo
+    // 1) Valida login e tipo de sender
     if (!checkLogin(sender)) return true;
     if (!(sender instanceof Player)) {
         send(sender, "Only players can use this command.");
@@ -933,7 +995,7 @@ private boolean doClaim(CommandSender sender) {
     }
 
     // 2) Obtém sessão
-    FileConfiguration uc = users.getUserConfig(((Player)sender).getName());
+    FileConfiguration uc = users.getUserConfig(((Player) sender).getName());
     final String sessionToken = uc.getString("session");
 
     // 3) Executa claim de forma assíncrona
@@ -942,35 +1004,43 @@ private boolean doClaim(CommandSender sender) {
         public void run() {
             try {
                 // 3.1) Tenta fazer o claim
-                String resp = api.post("/api/claim", "{}", sessionToken);
-                boolean success = parseBool(resp, "\"success\"");
-                double got = parseNum(resp, "\"claimed\"");
+                String respRaw = api.post("/api/claim", "{}", sessionToken);
+                JsonObject respJson = parseLenient(respRaw);
 
-                if (success && got > 0) {
+                boolean success = respJson.has("success") && respJson.get("success").getAsBoolean();
+                double claimed   = respJson.has("claimed") ? respJson.get("claimed").getAsDouble() : 0;
+
+                if (success && claimed > 0) {
                     // Claim bem‑sucedido
-                    String unit = (got == 1.0) ? " coin!" : " coins!";
-                    sendSync(sender, "You claimed " + fmt(got) + unit);
+                    String unit = (claimed == 1.0) ? " Coin!" : " Coins!";
+                    sendSync(sender, "§aYou successfully claimed " + fmt(claimed) + unit);
                 } else {
-                    // Não foi possível claimar (cooldown ou valor zero)
-                    String status = api.get("/api/claim/status", sessionToken);
-                    long ms = Long.parseLong(parseStr(status, "\"cooldownRemainingMs\""));
+                    // Em cooldown ou sem campo, busca status para saber quanto tempo falta
+                    String statusRaw = api.get("/api/claim/status", sessionToken);
+                    JsonObject statusJson = parseLenient(statusRaw);
+                    long ms = statusJson.has("cooldownRemainingMs")
+                              ? statusJson.get("cooldownRemainingMs").getAsLong()
+                              : 0;
+
                     long totalSec = ms / 1000;
                     long hours   = totalSec / 3600;
                     long minutes = (totalSec % 3600) / 60;
                     long seconds = totalSec % 60;
-                    String timeStr = hours + "h " + minutes + "m " + seconds + "s";
 
-                    sendSync(sender, "Wait to claim again. Next claim in " + timeStr);
+                    String timeStr = hours + "h " + minutes + "m " + seconds + "s";
+                    sendSync(sender, "§eWait more " + timeStr + " and try again!");
                 }
+
             } catch (Exception e) {
                 plugin.getLogger().warning("doClaim error: " + e.getMessage());
-                sendSync(sender, "Error during claim. Please try again later.");
+                sendSync(sender, "§cError during claim. Please try again later.");
             }
         }
     }.runTaskAsynchronously(plugin);
 
     return true;
 }
+
 
 private boolean doBackup(CommandSender sender) {
     // 1) Valida login e tipo de sender
@@ -984,42 +1054,80 @@ private boolean doBackup(CommandSender sender) {
     FileConfiguration uc = users.getUserConfig(player.getName());
     final String sessionToken = uc.getString("session");
 
-    // 2) Chama a API de forma assíncrona
     new BukkitRunnable() {
         @Override
         public void run() {
             try {
-                // 3) Lista todos os backups
-                String resp = api.post("/api/backup/list", "{}", sessionToken);
+                // 2) Cria um novo backup
+                String createResp = api.post("/api/backup/create", "{}", sessionToken);
+                JsonObject createJson = JsonParser.parseString(createResp).getAsJsonObject();
+                boolean created = createJson.has("success") && createJson.get("success").getAsBoolean();
+                String createdId = created && createJson.has("id")
+                    ? createJson.get("id").getAsString()
+                    : null;
 
-                // 4) Parseia JSON
-                JsonObject root   = JsonParser.parseString(resp).getAsJsonObject();
-                JsonArray backups = root.has("backups")
-                                    ? root.getAsJsonArray("backups")
-                                    : new JsonArray();
-
-                // 5) Monta mensagem formatada
-                if (backups.isEmpty()) {
-                    sendSync(sender, "ℹ️ You have no backups.");
+                // 3) Busca lista de backups (pode vir como array puro ou objeto com "backups")
+                String listResp = api.post("/api/backup/list", "{}", sessionToken);
+                JsonElement parsed = JsonParser.parseString(listResp);
+                JsonArray backups;
+                if (parsed.isJsonObject() && parsed.getAsJsonObject().has("backups")) {
+                    backups = parsed.getAsJsonObject().getAsJsonArray("backups");
+                } else if (parsed.isJsonArray()) {
+                    backups = parsed.getAsJsonArray();
                 } else {
-                    StringBuilder sb = new StringBuilder();
-                    sb.append("📋 **Your backups (").append(backups.size()).append("):**\n");
-                    for (int i = 0; i < backups.size(); i++) {
-                        JsonObject b = backups.get(i).getAsJsonObject();
-                        String id = b.get("id").getAsString();
-                        sb.append("**").append(i + 1).append(".** `").append(id).append("`\n");
+                    backups = new JsonArray();
+                }
+
+                // 4) Informa criação
+                if (created) {
+                    sendSync(sender, "§aBackup created!");
+                } else {
+                    sendSync(sender, "§cCould not create backup.");
+                }
+
+                // 5) Monta e envia lista no estilo /coin history
+                if (backups.isEmpty()) {
+                    sendSync(sender, "§eYou have no backups.");
+                } else {
+                    StringBuilder sb = new StringBuilder("§6Your backups:\n\n");
+                    int count = Math.min(backups.size(), 20);
+                    for (int i = 0; i < count; i++) {
+                        JsonElement el = backups.get(i);
+                        String id;
+                        if (el.isJsonPrimitive()) {
+                            id = el.getAsString();
+                        } else {
+                            JsonObject o = el.getAsJsonObject();
+                            id = o.has("id") ? o.get("id").getAsString()
+                               : o.has("backupId") ? o.get("backupId").getAsString()
+                               : "–";
+                        }
+                        sb.append("§eID: ").append(id).append("\n")
+                          .append("§7-------------------------\n");
                     }
                     sendSync(sender, sb.toString());
                 }
+
             } catch (Exception e) {
                 plugin.getLogger().warning("doBackup error: " + e.getMessage());
-                sendSync(sender, "Error listing backups. Please try again later.");
+                sendSync(sender, "§cError creating or listing backups. Please try again later.");
             }
         }
     }.runTaskAsynchronously(plugin);
 
     return true;
 }
+
+/**
+ * Parseia um JSON usando JsonReader leniente para aceitar pequenas
+ * irregularidades no texto retornado pela API.
+ */
+private JsonObject parseLenient(String json) {
+    JsonReader reader = new JsonReader(new StringReader(json));
+    reader.setLenient(true);
+    return JsonParser.parseReader(reader).getAsJsonObject();
+}
+
 
 
 private boolean doRestore(CommandSender sender, String[] args) {
@@ -1085,58 +1193,69 @@ private boolean doUser(CommandSender sender) {
     FileConfiguration uc = users.getUserConfig(player.getName());
     final String sessionToken = uc.getString("session");
     final String userId       = uc.getString("id");
+    final String username     = uc.getString("username", player.getName());
 
-    // 2) Executa fora da main thread
     new BukkitRunnable() {
         @Override
         public void run() {
             try {
-                // 2.1) Pega saldo atualizado via API
+                // 2.1) Balance
                 String balResp = api.get("/api/user/" + userId + "/balance", sessionToken);
-                double balance = parseNum(balResp, "\"coins\"");
-                uc.set("balance", balance);
+                JsonObject balJson = parseLenient(balResp);
+                double balance = balJson.has("coins")
+                                 ? balJson.get("coins").getAsDouble()
+                                 : 0;
 
-                // 2.2) Garante que o usuário tenha um cardCode salvo
-                String card = uc.getString("card", "");
-                if (card == null || card.isEmpty()) {
-                    String cardResp = api.post("/api/card", "{}", sessionToken);
-                    card = parseStr(cardResp, "\"cardCode\"");
-                    uc.set("card", card);
-                }
+                // 2.2) CardCode
+                String cardResp = api.post("/api/card", "{}", sessionToken);
+                JsonObject cardJson = parseLenient(cardResp);
+                String card = cardJson.has("cardCode")
+                              ? cardJson.get("cardCode").getAsString()
+                              : "–";
 
-                // 2.3) Salva config atualizada
-                users.saveUserConfig(player.getName(), uc);
-
-                // 2.4) Consulta cooldown de claim
-                String status = api.get("/api/claim/status", sessionToken);
-                long ms = Long.parseLong(parseStr(status, "\"cooldownRemainingMs\""));
+                // 2.3) Cooldown
+                String statusResp = api.get("/api/claim/status", sessionToken);
+                JsonObject statusJson = parseLenient(statusResp);
+                long ms = statusJson.has("cooldownRemainingMs")
+                          ? statusJson.get("cooldownRemainingMs").getAsLong()
+                          : 0;
                 String cooldownMsg;
                 if (ms <= 0) {
                     cooldownMsg = "Ready to claim!";
                 } else {
-                    long totalSec = ms / 1000;
-                    long hours   = totalSec / 3600;
-                    long minutes = (totalSec % 3600) / 60;
-                    long seconds = totalSec % 60;
-                    cooldownMsg = hours + "h " + minutes + "m " + seconds + "s";
+                    long sec = ms / 1000;
+                    long h = sec / 3600;
+                    long m = (sec % 3600) / 60;
+                    long s = sec % 60;
+                    cooldownMsg = h + "h " + m + "m " + s + "s to claim.";
                 }
 
-                // 2.5) Envia no thread principal
+                // 2.4) Atualiza config local (opcional)
+                uc.set("balance", balance);
+                uc.set("card", card);
+                users.saveUserConfig(player.getName(), uc);
+
+                // 2.5) Envia “card” no chat
                 sendSync(sender,
-                    "Coin Username: " + uc.getString("username"),
-                    "Coin Balance: "  + fmt(balance),
-                    "Coin Card: "     + card,
-                    "Claim Cooldown: "+ cooldownMsg
+                    "§7-----------------------------------------",
+                    "§eYour ID: §f"       + userId,
+                    "§eUsername: §f"      + username,
+                    "§eCard: §f"          + card,
+                    "§eBalance: §f"       + fmt(balance),
+                    "§eCooldown: §f"      + cooldownMsg,
+                    "§7-----------------------------------------"
                 );
+
             } catch (Exception e) {
                 plugin.getLogger().warning("doUser error: " + e.getMessage());
-                sendSync(sender, "Error fetching user info.");
+                sendSync(sender, "§cError fetching user info.");
             }
         }
     }.runTaskAsynchronously(plugin);
 
     return true;
 }
+
 
 
 
