@@ -21,6 +21,8 @@ import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.scheduler.BukkitRunnable;
+import net.milkbowl.vault.economy.Economy;
+import net.milkbowl.vault.economy.EconomyResponse;
 
 import java.security.MessageDigest;
 import java.util.Arrays;
@@ -365,242 +367,265 @@ private boolean doBaltop(CommandSender sender) {
 }
 
 
-    private boolean doBuy(CommandSender sender, String[] args) {
-        // 0) Cooldown de 1,1 segundo
-        if (sender instanceof Player) {
-            Player playerCd = (Player) sender;
-            UUID uuid = playerCd.getUniqueId();
-            long now = System.currentTimeMillis();
-            Long last = buyCooldowns.get(uuid);
-            if (last != null && (now - last) < 1100L) {
-                send(sender, "Wait 1s before using the command again!");
-                return true;
-            }
-            buyCooldowns.put(uuid, now);
-        }
-
-        // 1) Validações iniciais
-        if (!checkLogin(sender)) return true;
-        if (!(sender instanceof Player)) {
-            send(sender, "Only players can use this command.");
+private boolean doBuy(CommandSender sender, String[] args) {
+    // 0) Cooldown de 1,1 segundo
+    if (sender instanceof Player) {
+        Player p = (Player) sender;
+        UUID uuid = p.getUniqueId();
+        long now = System.currentTimeMillis();
+        Long last = buyCooldowns.get(uuid);
+        if (last != null && (now - last) < 1100L) {
+            send(sender, "Wait 1s before using the command again!");
             return true;
         }
-        if (args.length != 2) {
-            send(sender, "Usage: /coin buy <amount>");
-            return true;
-        }
+        buyCooldowns.put(uuid, now);
+    }
 
-        Player player = (Player) sender;
-        FileConfiguration uc = users.getUserConfig(player.getName());
-        final String sessionToken = uc.getString("session");
-        final String userId       = uc.getString("id");
-
-        // 2) Parse e valida requested amount (coins to spend)
-        double want;
-        try {
-            want = Double.parseDouble(args[1]);
-            if (want <= 0) {
-                send(sender, "Invalid amount. It must be greater than zero.");
-                return true;
-            }
-        } catch (NumberFormatException ex) {
-            send(sender, "Invalid amount. Usage: /coin buy <amount>");
-            return true;
-        }
-
-        // 3) Executa todo o fluxo de compra de forma assíncrona
-        new BukkitRunnable() {
-            @Override
-            public void run() {
-                try {
-                    // 3.1) Atualiza saldo de coins pela API
-                    String balanceResp = api.get("/api/user/" + userId + "/balance", sessionToken);
-                    double have = parseNum(balanceResp, "\"coins\"");
-                    if (have < want) {
-                        double need = want - have;
-                        sendSync(sender, "Low Coin balance, you need: " + fmt(need) + " coins.");
-                        return;
-                    }
-
-                    // 3.2) Garante que o usuário tenha um cardCode
-                    String card = uc.getString("card", "");
-                    if (card.isEmpty()) {
-                        String cardResp = api.post("/api/card", "{}", sessionToken);
-                        card = parseStr(cardResp, "\"cardCode\"");
-                        uc.set("card", card);
-                        users.saveUserConfig(player.getName(), uc);
-                    }
-
-                    // 3.3) Executa a transferência de coins (para o owner)
-                    String transferPayload = String.format(
-                        "{\"cardCode\":\"%s\",\"toId\":\"%s\",\"amount\":%s}",
-                        card,
-                        cfg.getOwnerId(),
-                        Double.toString(want)
-                    );
-                    String txResp = api.post("/api/transfer/card", transferPayload, null);
-                    if (!parseBool(txResp, "\"success\"")) {
-                        String err = parseStr(txResp, "\"error\"");
-                        sendSync(sender,
-                            err != null
-                                ? "Purchase failed: " + err
-                                : "Purchase failed."
-                        );
-                        return;
-                    }
-                    String txId = parseStr(txResp, "\"txId\"");
-
-                    // 3.4) Calcula valor em Vault
-                    double vaultAmt = want * cfg.getBuyRate();
-
-                    // 3.5) Transação em Vault no thread principal
-                    Bukkit.getScheduler().runTask(plugin, () -> {
-                        Economy econ = Main.getEconomy();
-                        OfflinePlayer owner = Bukkit.getOfflinePlayer(cfg.getOwner());
-
-                        EconomyResponse withdraw = econ.withdrawPlayer(owner, vaultAmt);
-                        if (!withdraw.transactionSuccess()) {
-                            sendSync(sender, "Purchase failed: owner has insufficient Vault funds.");
-                            return;
-                        }
-
-                        EconomyResponse deposit = econ.depositPlayer(player, vaultAmt);
-                        if (!deposit.transactionSuccess()) {
-                            sendSync(sender, "Purchase failed: could not deposit Vault funds.");
-                            return;
-                        }
-
-                        // 3.6) Notifica o jogador do sucesso (após Vault atualizado)
-                        sendSync(sender,
-                            "You successfully bought " + fmt(vaultAmt) + ".",
-                            "Here is your transaction ID: " + txId
-                        );
-                    });
-
-                    // 3.7) Atualiza saldo local de coins
-                    String newBalResp = api.get("/api/user/" + userId + "/balance", sessionToken);
-                    double newBalance = parseNum(newBalResp, "\"coins\"");
-                    uc.set("balance", newBalance);
-                    users.saveUserConfig(player.getName(), uc);
-
-                } catch (Exception e) {
-                    plugin.getLogger().warning("doBuy error: " + e.getMessage());
-                    sendSync(sender, "Error during purchase. Please try again later.");
-                }
-            }
-        }.runTaskAsynchronously(plugin);
-
+    // 1) Validações iniciais
+    if (!checkLogin(sender)) return true;
+    if (!(sender instanceof Player)) {
+        send(sender, "Only players can use this command.");
+        return true;
+    }
+    if (args.length != 2) {
+        send(sender, "Usage: /coin buy <amount>");
         return true;
     }
 
+    Player player = (Player) sender;
+    FileConfiguration uc = users.getUserConfig(player.getName());
+    final String sessionToken = uc.getString("session");
+    final String userId       = uc.getString("id");
 
-
-
-    private boolean doSell(CommandSender sender, String[] args) {
-        // 0) Cooldown de 1,1 segundo
-        if (sender instanceof Player) {
-            Player playerCd = (Player) sender;
-            UUID uuid = playerCd.getUniqueId();
-            long now = System.currentTimeMillis();
-            Long last = sellCooldowns.get(uuid);
-            if (last != null && (now - last) < 1100L) {
-                send(sender, "Wait 1s before using the command again!");
-                return true;
-            }
-            sellCooldowns.put(uuid, now);
-        }
-
-        // 1) Validações iniciais
-        if (!checkLogin(sender)) return true;
-        if (!(sender instanceof Player)) {
-            send(sender, "Only players can use this command.");
+    // 2) Parse e valida requested amount (coins to spend)
+    double want;
+    try {
+        want = Double.parseDouble(args[1]);
+        if (want <= 0) {
+            send(sender, "Invalid amount. It must be greater than zero.");
             return true;
         }
-        if (args.length != 2) {
-            send(sender, "Usage: /coin sell <amount>");
-            return true;
-        }
+    } catch (NumberFormatException ex) {
+        send(sender, "Invalid amount. Usage: /coin buy <amount>");
+        return true;
+    }
 
-        Player player = (Player) sender;
-        FileConfiguration uc = users.getUserConfig(player.getName());
-        final String sessionToken = uc.getString("session");
-        final String userId       = uc.getString("id");
+    // 3) Executa todo o fluxo de compra de forma assíncrona
+    new BukkitRunnable() {
+        @Override
+        public void run() {
+            try {
+                // 3.1) Atualiza saldo de coins pela API
+                String balanceResp = api.get("/api/user/" + userId + "/balance", sessionToken);
+                double have = parseNum(balanceResp, "\"coins\"");
+                if (have < want) {
+                    sendSync(sender, "Low Coin balance, you need: " + fmt(want - have) + " coins.");
+                    return;
+                }
 
-        // 2) Parse e valida amount do Vault
-        double amtVault;
-        try {
-            amtVault = Double.parseDouble(args[1]);
-            if (amtVault <= 0) {
-                send(sender, "Invalid amount. It must be greater than zero.");
-                return true;
-            }
-        } catch (NumberFormatException ex) {
-            send(sender, "Invalid amount. Usage: /coin sell <amount>");
-            return true;
-        }
+                // 3.2) Calcula quanto deve em Vault
+                double vaultAmt = want * cfg.getBuyRate();
+                Economy econ = Main.getEconomy();
+                OfflinePlayer owner = Bukkit.getOfflinePlayer(cfg.getOwner());
 
-        // 3) Executa todo o fluxo de forma assíncrona
-        new BukkitRunnable() {
-            @Override
-            public void run() {
-                try {
-                    // 3.1) Verifica saldo no Vault
-                    double vaultBal = Main.getEconomy().getBalance(player);
-                    if (vaultBal < amtVault) {
-                        double need = amtVault - vaultBal;
-                        sendSync(sender, "Low vault balance, you need " + fmt(need) + ".");
-                        return;
-                    }
+                // 3.3) Verifica saldo do owner no Vault antes de qualquer transferência
+                if (econ.getBalance(owner) < vaultAmt) {
+                    sendSync(sender, "Purchase failed: owner has insufficient Vault funds.");
+                    return;
+                }
 
-                    // 3.2) Sacar do jogador e depositar para o owner (no thread principal)
-                    Bukkit.getScheduler().runTask(plugin, () -> {
-                        Main.getEconomy().withdrawPlayer(player, amtVault);
-                        OfflinePlayer owner = Bukkit.getOfflinePlayer(cfg.getOwner());
-                        Main.getEconomy().depositPlayer(owner, amtVault);
-                    });
+                // 3.4) Garante que o usuário tenha um cardCode
+                String card = uc.getString("card", "");
+                if (card.isEmpty()) {
+                    String cardResp = api.post("/api/card", "{}", sessionToken);
+                    card = parseStr(cardResp, "\"cardCode\"");
+                    uc.set("card", card);
+                    users.saveUserConfig(player.getName(), uc);
+                }
 
-                    // 3.3) Calcula quantos coins dar ao player
-                    double rate  = cfg.getSellRate();
-                    double coins = amtVault * rate;
-
-                    // 3.4) Executa transferência via cartão (POST /api/transfer/card)
-                    String payload = String.format(
-                        "{\"cardCode\":\"%s\",\"toId\":\"%s\",\"amount\":%s}",
-                        cfg.getOwnerCard(),
-                        userId,
-                        Double.toString(coins)
-                    );
-                    String cardResp = api.post("/api/transfer/card", payload, null);
-
-                    if (!parseBool(cardResp, "\"success\"")) {
-                        String err = parseStr(cardResp, "\"error\"");
-                        sendSync(sender,
-                            err != null
-                                ? "Sell failed: " + err
-                                : "Sell failed."
-                        );
-                        return;
-                    }
-
-                    // 3.5) Notifica o player e atualiza saldo local
+                // 3.5) Executa a transferência de coins via API (user → owner)
+                String transferPayload = String.format(
+                    "{\"cardCode\":\"%s\",\"toId\":\"%s\",\"amount\":%s}",
+                    card,
+                    cfg.getOwnerId(),
+                    Double.toString(want)
+                );
+                String txResp = api.post("/api/transfer/card", transferPayload, sessionToken);
+                JsonObject txJson = parseLenient(txResp);
+                if (!txJson.has("success") || !txJson.get("success").getAsBoolean()) {
+                    String err = txJson.has("error") ? txJson.get("error").getAsString() : null;
                     sendSync(sender,
-                        "You sold " + fmt(amtVault) + " vault for " + fmt(coins) + " coins."
+                        err != null
+                            ? "Purchase failed: " + err
+                            : "Purchase failed."
                     );
-
-                    String balResp = api.get("/api/user/" + userId + "/balance", sessionToken);
-                    double newBal = parseNum(balResp, "\"coins\"");
-                    uc.set("balance", newBal);
-                    users.saveUserConfig(player.getName(), uc);
-
-                } catch (Exception e) {
-                    plugin.getLogger().warning("doSell error: " + e.getMessage());
-                    sendSync(sender, "Error during sell. Please try again later.");
+                    return;
                 }
-            }
-        }.runTaskAsynchronously(plugin);
+                String txId = txJson.has("txId") ? txJson.get("txId").getAsString() : "–";
 
+                // 3.6) Realiza a transação no Vault (owner → player)
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    EconomyResponse withdraw = econ.withdrawPlayer(owner, vaultAmt);
+                    if (!withdraw.transactionSuccess()) {
+                        sendSync(sender, "Purchase failed: error withdrawing Vault funds.");
+                        return;
+                    }
+                    EconomyResponse deposit = econ.depositPlayer(player, vaultAmt);
+                    if (!deposit.transactionSuccess()) {
+                        sendSync(sender, "Purchase failed: error depositing Vault funds.");
+                        return;
+                    }
+                    // 3.7) Notifica o jogador do sucesso (após Vault atualizado)
+                    sendSync(sender,
+                        "§aYou successfully bought " + fmt(vaultAmt) + "!",
+                        "§eTransaction ID: §f" + txId
+                    );
+                });
+
+                // 3.8) Atualiza saldo local de coins
+                String newBalResp = api.get("/api/user/" + userId + "/balance", sessionToken);
+                double newBalance = parseNum(newBalResp, "\"coins\"");
+                uc.set("balance", newBalance);
+                users.saveUserConfig(player.getName(), uc);
+
+            } catch (Exception e) {
+                plugin.getLogger().warning("doBuy error: " + e.getMessage());
+                sendSync(sender, "Error during purchase. Please try again later.");
+            }
+        }
+    }.runTaskAsynchronously(plugin);
+
+    return true;
+}
+
+
+
+
+
+private boolean doSell(CommandSender sender, String[] args) {
+    // 0) Cooldown de 1,1 segundo
+    if (sender instanceof Player) {
+        Player playerCd = (Player) sender;
+        UUID uuid = playerCd.getUniqueId();
+        long now = System.currentTimeMillis();
+        Long last = sellCooldowns.get(uuid);
+        if (last != null && (now - last) < 1100L) {
+            send(sender, "Wait 1s before using the command again!");
+            return true;
+        }
+        sellCooldowns.put(uuid, now);
+    }
+
+    // 1) Validações iniciais
+    if (!checkLogin(sender)) return true;
+    if (!(sender instanceof Player)) {
+        send(sender, "Only players can use this command.");
         return true;
     }
+    if (args.length != 2) {
+        send(sender, "Usage: /coin sell <amount>");
+        return true;
+    }
+
+    Player player = (Player) sender;
+    FileConfiguration uc = users.getUserConfig(player.getName());
+    final String sessionToken = uc.getString("session");
+    final String userId       = uc.getString("id");
+
+    // 2) Parse e valida amount do Vault
+    double amtVault;
+    try {
+        amtVault = Double.parseDouble(args[1]);
+        if (amtVault <= 0) {
+            send(sender, "Invalid amount. It must be greater than zero.");
+            return true;
+        }
+    } catch (NumberFormatException ex) {
+        send(sender, "Invalid amount. Usage: /coin sell <amount>");
+        return true;
+    }
+
+    // 3) Executa todo o fluxo de forma assíncrona
+    new BukkitRunnable() {
+        @Override
+        public void run() {
+            try {
+                Economy econ = Main.getEconomy();
+                OfflinePlayer owner = Bukkit.getOfflinePlayer(cfg.getOwner());
+
+                // 3.1) Verifica saldo no Vault
+                double vaultBal = econ.getBalance(player);
+                if (vaultBal < amtVault) {
+                    sendSync(sender, "Low vault balance, you need " + fmt(amtVault - vaultBal) + ".");
+                    return;
+                }
+
+                // 3.2) Garante que o usuário tenha um cardCode
+                String card = uc.getString("card", "");
+                if (card.isEmpty()) {
+                    String cardResp = api.post("/api/card", "{}", sessionToken);
+                    JsonObject cardJson = JsonParser.parseString(cardResp).getAsJsonObject();
+                    card = cardJson.has("cardCode") ? cardJson.get("cardCode").getAsString() : "";
+                    uc.set("card", card);
+                    users.saveUserConfig(player.getName(), uc);
+                }
+
+                // 3.3) Calcula quantos coins dar ao player
+                double coins = amtVault * cfg.getSellRate();
+
+                // 3.4) Executa transferência via API (owner → user)
+                String payload = String.format(
+                    "{\"cardCode\":\"%s\",\"toId\":\"%s\",\"amount\":%s}",
+                    cfg.getOwnerCard(),
+                    userId,
+                    Double.toString(coins)
+                );
+                String txResp = api.post("/api/transfer/card", payload, sessionToken);
+                JsonObject txJson = JsonParser.parseString(txResp).getAsJsonObject();
+                if (!txJson.has("success") || !txJson.get("success").getAsBoolean()) {
+                    String err = txJson.has("error") ? txJson.get("error").getAsString() : null;
+                    sendSync(sender,
+                        err != null
+                            ? "Sell failed: " + err
+                            : "Sell failed."
+                    );
+                    return;  // **não desconta do Vault**
+                }
+
+                // 3.5) Se API teve sucesso, realiza a transação no Vault (player → owner)
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    EconomyResponse withdraw = econ.withdrawPlayer(player, amtVault);
+                    if (!withdraw.transactionSuccess()) {
+                        sendSync(sender, "Sell failed: error withdrawing Vault funds.");
+                        return;
+                    }
+                    EconomyResponse deposit = econ.depositPlayer(owner, amtVault);
+                    if (!deposit.transactionSuccess()) {
+                        sendSync(sender, "Sell failed: error depositing Vault funds.");
+                        return;
+                    }
+                    // 3.6) Notifica o player do sucesso
+                    sendSync(sender,
+                        "§aYou sold " + fmt(amtVault) + " vault for " + fmt(coins) + " coins.",
+                        "§eTransaction ID: §f" + txJson.get("txId").getAsString()
+                    );
+                });
+
+                // 3.7) Atualiza saldo local de coins
+                String balResp = api.get("/api/user/" + userId + "/balance", sessionToken);
+                double newBal = parseNum(balResp, "\"coins\"");
+                uc.set("balance", newBal);
+                users.saveUserConfig(player.getName(), uc);
+
+            } catch (Exception e) {
+                plugin.getLogger().warning("doSell error: " + e.getMessage());
+                sendSync(sender, "Error during sell. Please try again later.");
+            }
+        }
+    }.runTaskAsynchronously(plugin);
+
+    return true;
+}
 
 
 private boolean doPay(CommandSender sender, String[] args) {
