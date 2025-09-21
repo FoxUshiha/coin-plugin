@@ -58,7 +58,7 @@ public class CoinCommandExecutor implements CommandExecutor, TabCompleter {
     private static final List<String> SUBCOMMANDS = Arrays.asList(
         "help", "register", "login", "logout", "bal", "baltop",
         "buy", "sell", "pay", "bill", "paybill", "bills", "history",
-        "claim", "backup", "restore", "user", "reload"
+        "claim", "backup", "restore", "user", "server", "reload"
     );
 
     // cooldown de 1,1s por jogador para os comandos buy e sell
@@ -99,6 +99,8 @@ public class CoinCommandExecutor implements CommandExecutor, TabCompleter {
                 "/coin backup",
                 "/coin restore <id>",
                 "/coin user",
+                "/coin server pay nick <amt>",
+                "/coin server payid <id> <amt>",
                 "/coin reload (admin)"
             );
             return true;
@@ -122,6 +124,17 @@ public class CoinCommandExecutor implements CommandExecutor, TabCompleter {
             case "backup":   return doBackup(sender);
             case "restore":  return doRestore(sender, args);
             case "user":     return doUser(sender);
+            case "server": // ⬅️ Aqui você trata os subcomandos: pay e payid
+        if (args.length >= 2 && args[1].equalsIgnoreCase("pay")) {
+            return doServerPay(sender, args);
+        } else if (args.length >= 2 && args[1].equalsIgnoreCase("payid")) {
+            return doServerPayId(sender, args);
+        } else {
+            send(sender, "Usage:");
+            send(sender, "/coin server pay <player> <amount>");
+            send(sender, "/coin server payid <coinId> <amount>");
+            return true;
+        }
             default:
                 send(sender, "Unknown subcommand. See /coin help");
                 return true;
