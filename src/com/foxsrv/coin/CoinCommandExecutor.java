@@ -23,6 +23,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.scheduler.BukkitRunnable;
 import net.milkbowl.vault.economy.Economy;
 import net.milkbowl.vault.economy.EconomyResponse;
+import org.bukkit.command.ConsoleCommandSender;
 
 import java.security.MessageDigest;
 import java.util.Arrays;
@@ -1308,6 +1309,148 @@ private boolean doUser(CommandSender sender) {
             } catch (Exception e) {
                 plugin.getLogger().warning("doUser error: " + e.getMessage());
                 sendSync(sender, "§cError fetching user info.");
+            }
+        }
+    }.runTaskAsynchronously(plugin);
+
+    return true;
+}
+
+
+
+
+// Comando: /coin server pay <player> <amount>
+private boolean doServerPay(CommandSender sender, String[] args) {
+    if (!(sender instanceof ConsoleCommandSender || sender.isOp())) {
+        send(sender, "§cOnly OPs or console can use this command.");
+        return true;
+    }
+
+    if (args.length != 4 || !args[1].equalsIgnoreCase("pay")) {
+        send(sender, "Usage: /coin server pay <player> <amount>");
+        return true;
+    }
+
+    String targetName = args[2];
+    String amountRaw = args[3];
+    double amount;
+
+    try {
+        amount = Double.parseDouble(amountRaw);
+        if (amount <= 0) {
+            send(sender, "Invalid amount. Must be greater than 0.");
+            return true;
+        }
+    } catch (NumberFormatException e) {
+        send(sender, "Invalid amount format.");
+        return true;
+    }
+
+    // Verifica se o usuário está logado
+    if (!users.isLoggedIn(targetName)) {
+        send(sender, "This user needs to login first!");
+        Player target = Bukkit.getPlayerExact(targetName);
+        if (target != null && target.isOnline()) {
+            sendSync(target, "§cYou need to login with /coin login <username> <password> to being able to use coins in the server.");
+        }
+        return true;
+    }
+
+    final String serverCard = cfg.getOwnerCard();
+    final String targetId = users.getUserConfig(targetName).getString("id");
+
+    if (serverCard == null || serverCard.isEmpty()) {
+        send(sender, "§cServer card is not configured in config.yml!");
+        return true;
+    }
+
+    new BukkitRunnable() {
+        @Override
+        public void run() {
+            try {
+                String payload = String.format(
+                    "{\"cardCode\":\"%s\",\"toId\":\"%s\",\"amount\":%s}",
+                    serverCard, targetId, Double.toString(amount)
+                );
+
+                String resp = api.post("/api/transfer/card", payload, null);
+                JsonObject txJson = parseLenient(resp);
+
+                if (!txJson.has("success") || !txJson.get("success").getAsBoolean()) {
+                    sendSync(sender, "No enough of funds.");
+                    return;
+                }
+
+                String txId = txJson.has("txId") ? txJson.get("txId").getAsString() : "–";
+                sendSync(sender, "§aSuccess! Transaction: §f" + txId);
+
+            } catch (Exception e) {
+                plugin.getLogger().warning("doServerPay error: " + e.getMessage());
+                sendSync(sender, "§cError while sending coins from server.");
+            }
+        }
+    }.runTaskAsynchronously(plugin);
+
+    return true;
+}
+
+
+// Comando: /coin server payid <coinId> <amount>
+private boolean doServerPayId(CommandSender sender, String[] args) {
+    if (!(sender instanceof ConsoleCommandSender || sender.isOp())) {
+        send(sender, "§cOnly OPs or console can use this command.");
+        return true;
+    }
+
+    if (args.length != 4 || !args[1].equalsIgnoreCase("payid")) {
+        send(sender, "Usage: /coin server payid <coinId> <amount>");
+        return true;
+    }
+
+    String targetId = args[2];
+    String amountRaw = args[3];
+    double amount;
+
+    try {
+        amount = Double.parseDouble(amountRaw);
+        if (amount <= 0) {
+            send(sender, "Invalid amount. Must be greater than 0.");
+            return true;
+        }
+    } catch (NumberFormatException e) {
+        send(sender, "Invalid amount format.");
+        return true;
+    }
+
+    final String serverCard = cfg.getOwnerCard();
+    if (serverCard == null || serverCard.isEmpty()) {
+        send(sender, "§cServer card is not configured in config.yml!");
+        return true;
+    }
+
+    new BukkitRunnable() {
+        @Override
+        public void run() {
+            try {
+                String payload = String.format(
+                    "{\"cardCode\":\"%s\",\"toId\":\"%s\",\"amount\":%s}",
+                    serverCard, targetId, Double.toString(amount)
+                );
+
+                String resp = api.post("/api/transfer/card", payload, null);
+                JsonObject txJson = parseLenient(resp);
+
+                if (!txJson.has("success") || !txJson.get("success").getAsBoolean()) {
+                    sendSync(sender, "No enough of funds.");
+                    return;
+                }
+
+                String txId = txJson.has("txId") ? txJson.get("txId").getAsString() : "–";
+                sendSync(sender, "§aSuccess! Transaction: §f" + txId);
+
+            } catch (Exception e) {
+                plugin.getLogger().warning("doServerPayId error: " + e.getMessage());
+                sendSync(sender, "§cError while sending coins from server.");
             }
         }
     }.runTaskAsynchronously(plugin);
